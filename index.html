@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>코트랄 출고정보 자동화 시스템 (v3)</title>
+    <title>코트랄 출고정보 자동화 시스템 (v7)</title>
     <!-- PDF.js 라이브러리 (CDN) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.11.338/pdf.min.js"></script>
     <!-- SheetJS (XLSX.js) 라이브러리 (CDN) -->
@@ -313,8 +313,11 @@
                 if (pdfFiles.length === 0) throw new Error("PDF 파일을 업로드해주세요.");
                 fedexData = (await Promise.all(pdfFiles.map(processPdfFile))).flat();
             }
-            if (shippingData.length === 0 && fedexData.length === 0) {
-                 alert("처리된 데이터가 없습니다. 파일의 내용과 형식을 다시 확인해주세요.");
+            if ((option === 'excel' || option === 'compare') && shippingData.length === 0) {
+                throw new Error("엑셀에서 OTOS 출고정보를 찾지 못했습니다. 'Customs Invoice' 시트와 PACKING 영역을 확인해주세요.");
+            }
+            if ((option === 'pdf' || option === 'compare') && fedexData.length === 0) {
+                throw new Error("PDF에서 COTRAL의 FedEx 정보를 찾지 못했습니다. PDF가 텍스트 형식인지 확인해주세요.");
             }
             
             const sortFn = (a, b) => new Date(a.OTOS출고일 || a.Fedex선적일) - new Date(b.OTOS출고일 || b.Fedex선적일);
@@ -372,6 +375,11 @@
     function extractShippingInfo(worksheet, filename) {
         const json = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
         const date = extractDateFromFilename(filename);
+        const parseStandaloneNumber = value => {
+            if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+            const normalized = String(value ?? '').trim().replace(/,/g, '');
+            return /^\d+(?:\.\d+)?$/.test(normalized) ? Number(normalized) : null;
+        };
         let packingRowIndex = -1;
         for (let i = 0; i < json.length; i++) {
             if (json[i].some(cell => typeof cell === 'string' && cell.toUpperCase().includes('PACKING'))) {
@@ -382,18 +390,76 @@
         if (packingRowIndex === -1) return [];
 
         const extractedData = [];
-        const searchLimit = Math.min(packingRowIndex + 11, json.length);
+        const packingHeaderText = json[packingRowIndex].join(' ');
+        const cartonCountMatch = packingHeaderText.match(/(\d+)\s*cartons?\b/i);
+        const expectedCartonCount = cartonCountMatch ? parseInt(cartonCountMatch[1], 10) : null;
+
+        // PACKING 행과 그 아래 20개 행을 검사한다.
+        // 기존 양식(크기 / 중량 / 수량)과 신규 양식(수량, 크기, 중량이 서로 다른 열)을 모두 지원한다.
+        const searchLimit = Math.min(packingRowIndex + 21, json.length);
         for (let i = packingRowIndex; i < searchLimit; i++) {
-            const rowStr = json[i].join(' ');
-            const match = rowStr.match(/(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+)\s*mm\s*\/\s*([\d.]+)\s*kg\s*\/\s*(\d+)\s*ea/i);
-            if (match) {
+            const row = json[i];
+            const rowStr = row.join(' ');
+            let sizeMatch = null;
+            let sizeCellIndex = -1;
+            let sizeCellText = '';
+
+            // 크기가 들어 있는 셀을 먼저 찾은 뒤 그 위치를 기준으로 수량과 중량을 찾는다.
+            for (let cellIndex = 0; cellIndex < row.length; cellIndex++) {
+                const cellText = String(row[cellIndex] ?? '');
+                const match = cellText.match(/(\d+(?:\.\d+)?)\s*[*×xX]\s*(\d+(?:\.\d+)?)\s*[*×xX]\s*(\d+(?:\.\d+)?)\s*mm\b/i);
+                if (match) {
+                    sizeMatch = match;
+                    sizeCellIndex = cellIndex;
+                    sizeCellText = cellText;
+                    break;
+                }
+            }
+
+            if (!sizeMatch) continue;
+
+            // 기존 양식: 크기와 함께 적힌 "5.7kg"을 읽는다.
+            const textAfterSize = sizeCellText.slice(sizeMatch.index + sizeMatch[0].length);
+            const inlineWeightMatch = textAfterSize.match(/(\d+(?:[.,]\d+)?)\s*kg\b/i);
+            let numericWeight = inlineWeightMatch ? parseFloat(inlineWeightMatch[1].replace(',', '.')) : null;
+
+            // 신규 양식: 크기 셀 오른쪽의 단위 없는 숫자 셀을 개별 박스 중량으로 읽는다.
+            if (numericWeight === null) {
+                for (let cellIndex = sizeCellIndex + 1; cellIndex < row.length; cellIndex++) {
+                    const cellText = String(row[cellIndex] ?? '');
+                    const unitWeightMatch = cellText.match(/(\d+(?:[.,]\d+)?)\s*kg\b/i);
+                    const value = unitWeightMatch
+                        ? parseFloat(unitWeightMatch[1].replace(',', '.'))
+                        : parseStandaloneNumber(row[cellIndex]);
+                    if (value !== null) {
+                        numericWeight = value;
+                        break;
+                    }
+                }
+            }
+
+            // 기존 양식은 "162ea", 신규 양식은 크기 셀 왼쪽의 숫자 셀(예: 123)을 사용한다.
+            const inlineQuantityMatch = rowStr.match(/(\d[\d,]*)\s*ea\b/i);
+            let quantity = inlineQuantityMatch ? parseInt(inlineQuantityMatch[1].replace(/,/g, ''), 10) : null;
+            if (quantity === null) {
+                for (let cellIndex = sizeCellIndex - 1; cellIndex >= 0; cellIndex--) {
+                    const value = parseStandaloneNumber(row[cellIndex]);
+                    if (value !== null && Number.isInteger(value)) {
+                        quantity = value;
+                        break;
+                    }
+                }
+            }
+
+            if (numericWeight !== null && quantity !== null) {
                 try {
-                    const [_, w, l, h, weightStr, quantity] = match;
-                    const w_cm = Math.round(parseInt(w) / 10);
-                    const l_cm = Math.round(parseInt(l) / 10);
-                    const h_cm = Math.round(parseInt(h) / 10);
-                    const numericWeight = parseFloat(weightStr);
-                    let numericVolume = (parseInt(w) * parseInt(l) * parseInt(h)) / 5000000;
+                    const w = parseFloat(sizeMatch[1]);
+                    const l = parseFloat(sizeMatch[2]);
+                    const h = parseFloat(sizeMatch[3]);
+                    const w_cm = Math.round(w / 10);
+                    const l_cm = Math.round(l / 10);
+                    const h_cm = Math.round(h / 10);
+                    let numericVolume = (w * l * h) / 5000000;
                     if (numericWeight < 1) {
                         numericVolume = 0;
                     }
@@ -404,9 +470,11 @@
                         '출고 박스수량': 1,
                         '출고 크기': `${w_cm}×${l_cm}×${h_cm}cm`,
                         '출고 중량': numericWeight,
-                        '출고 수량': parseInt(quantity, 10),
+                        '출고 수량': quantity,
                         '출고 부피': finalVolume,
                     });
+
+                    if (expectedCartonCount && extractedData.length >= expectedCartonCount) break;
                 } catch (e) { console.error(`[Excel: ${filename}] 데이터 파싱 중 오류 (행: ${i}): ${e.message}`); }
             }
         }
@@ -436,31 +504,78 @@
     function extractFedexInfo(text, filename) {
         const results = [];
         const sections = text.split(/Ship Date/g).slice(1);
+        const normalizeSizeText = size => size
+            ? size.replace(/,/g, '.').replace(/\s/g, '').replace(/[xX]/g, '×').replace(/cm$/i, '') + 'cm'
+            : 'N/A';
+        const normalizeWeightType = type => {
+            const value = String(type || '').toLowerCase();
+            if (value.includes('dim')) return 'Customer Dim weight';
+            if (value.includes('provided')) return 'Customer provided weight';
+            if (value.includes('captured')) return 'FedEx captured weight';
+            if (value.includes('actual')) return 'Actual Weight';
+            return 'N/A';
+        };
+
         sections.forEach(section => {
             const recipientMatch = section.match(/Recipient([\s\S]+?)(?:Shipper|발송인|운임\s*Freight Charges)/i);
             if (!recipientMatch || !recipientMatch[1].toLowerCase().includes("cotral")) return;
-            const shipDateMatch = section.match(/(\d{2}\/\d{2}\/\d{4})/);
+
+            const shipDateMatch = section.match(/(\d{2})\/(\d{2})\/(\d{4})/);
             if (!shipDateMatch) return;
-            const shipDate = new Date(shipDateMatch[1]);
-            const formattedShipDate = `${shipDate.getFullYear()}-${String(shipDate.getMonth() + 1).padStart(2, '0')}-${String(shipDate.getDate()).padStart(2, '0')}`;
+            const formattedShipDate = `${shipDateMatch[3]}-${shipDateMatch[1]}-${shipDateMatch[2]}`;
+            const piecesMatch = section.match(/Pieces\s+(\d+)/i);
+            const pieces = piecesMatch ? parseInt(piecesMatch[1], 10) : null;
             const packageDetailsMatch = section.match(/Package Details\s+패키지\s+세부정보([\s\S]*)/i);
-            if (!packageDetailsMatch) return;
-            const detailsText = packageDetailsMatch[1];
-            const uniqueTrackingIds = [...new Set([...detailsText.matchAll(/(\d{12})/g)].map(m => m[0]))];
-            uniqueTrackingIds.forEach(trackingId => {
-                const trackingIdRegex = new RegExp(trackingId + '([\\s\\S]*?)(?=' + (uniqueTrackingIds[uniqueTrackingIds.indexOf(trackingId) + 1] || '$') + ')');
-                const itemText = detailsText.match(trackingIdRegex)?.[0] || '';
-                const ratedWeightMatch = itemText.match(/(\d+\.\d+)\s*kg/);
-                const weightTypeMatch = itemText.match(/(Customer Dim weight|Actual Weight)/);
-                const sizeMatch = itemText.match(/\(([\d\s.x]+cm)\)/);
+
+            // 여러 박스는 Package Details 표에서 각 Tracking ID별 정보를 추출한다.
+            if (packageDetailsMatch) {
+                const detailsText = packageDetailsMatch[1];
+                const uniqueTrackingIds = [...new Set([...detailsText.matchAll(/(\d{12})/g)].map(m => m[0]))];
+
+                uniqueTrackingIds.forEach((trackingId, index) => {
+                    const nextTrackingId = uniqueTrackingIds[index + 1] || '$';
+                    const trackingIdRegex = new RegExp(trackingId + '([\\s\\S]*?)(?=' + nextTrackingId + ')');
+                    const itemText = detailsText.match(trackingIdRegex)?.[0] || '';
+                    const itemPattern = new RegExp(
+                        '^' + trackingId +
+                        '\\s+(\\d+(?:[.,]\\d+)?)\\s*kg\\s*' +
+                        '(Customer\\s+(?:Dim|Dimensional|provided)\\s+weight|FedEx\\s+captured\\s+weight|Actual\\s+Weight)?' +
+                        '(?:\\s*\\(\\s*([\\d.,]+\\s*[xX×]\\s*[\\d.,]+\\s*[xX×]\\s*[\\d.,]+)\\s*(?:cm)?\\s*\\))?',
+                        'i'
+                    );
+                    const itemMatch = itemText.match(itemPattern);
+                    const ratedWeight = itemMatch?.[1] || null;
+                    const weightType = itemMatch?.[2] || null;
+                    const size = itemMatch?.[3] || null;
+
+                    results.push({
+                        'Fedex선적일': formattedShipDate,
+                        'Tracking ID': trackingId,
+                        '정격 중량': ratedWeight ? ratedWeight.replace(',', '.') + 'kg' : 'N/A',
+                        '중량 유형': normalizeWeightType(weightType),
+                        '크기': normalizeSizeText(size),
+                    });
+                });
+                return;
+            }
+
+            // 단일 박스는 Package Details 표가 없어 발송 본문의 AWB/Weight/Dimension을 사용한다.
+            if (pieces !== 1) return;
+            const trackingIdMatch = section.match(/Air Waybill Number\s+(\d{12})/i);
+            const shipmentWeightMatch = section.match(/(?:^|\s)Weight\s+(\d+(?:[.,]\d+)?)\s*kg/i);
+            const dimensionMatch = section.match(/Dimension\s+([\d.,]+\s*[xX×]\s*[\d.,]+\s*[xX×]\s*[\d.,]+)\s*cm/i);
+            const dimensionalWeightMatch = section.match(/based on a dimensional weight of\s+(\d+(?:[.,]\d+)?)\s*kg/i);
+
+            if (trackingIdMatch && shipmentWeightMatch && dimensionMatch) {
+                const ratedWeight = dimensionalWeightMatch?.[1] || shipmentWeightMatch[1];
                 results.push({
                     'Fedex선적일': formattedShipDate,
-                    'Tracking ID': trackingId,
-                    '정격 중량': ratedWeightMatch ? ratedWeightMatch[1] + 'kg' : 'N/A',
-                    '중량 유형': weightTypeMatch ? weightTypeMatch[1] : 'N/A',
-                    '크기': sizeMatch ? sizeMatch[1].replace(/\s/g, '').replace(/cm$/, '').replace(/x/g, '×') + 'cm' : 'N/A',
+                    'Tracking ID': trackingIdMatch[1],
+                    '정격 중량': ratedWeight.replace(',', '.') + 'kg',
+                    '중량 유형': dimensionalWeightMatch ? 'Customer Dim weight' : 'Actual Weight',
+                    '크기': normalizeSizeText(dimensionMatch[1]),
                 });
-            });
+            }
         });
         return results;
     }
@@ -474,7 +589,8 @@
         fedexData.forEach(fedex => {
             const fedexSizeNormalized = normalizeSize(fedex.크기);
             // FedEx 데이터에서 숫자 중량 추출 (예: "5.9kg" -> 5.9)
-            const fedexWeight = fedex['정격 중량'] ? parseFloat(fedex['정격 중량']) : null;
+            const fedexWeight = parseFloat(fedex['정격 중량']);
+            const weightType = String(fedex['중량 유형'] || '').toLowerCase();
             
             let bestMatchIndex = -1;
             for (let i = 0; i < shippingDataCopy.length; i++) {
@@ -486,18 +602,36 @@
                 // 조건 2: 크기 일치
                 const sizeMatch = fedexSizeNormalized === normalizeSize(shipping['출고 크기']);
                 
-                // 조건 3: 정격 중량(FedEx)과 출고 부피(OTOS) 일치 (부동소수점 오차 감안)
-                const weightVolumeMatch = (fedexWeight !== null) && (Math.abs(fedexWeight - shipping['출고 부피']) < 0.01);
+                // 조건 3: FedEx 중량 유형에 맞는 OTOS 중량과 비교한다.
+                // Customer Dim Weight는 부피중량, Actual Weight는 실제 출고중량을 사용한다.
+                const candidateWeights = weightType.includes('dim')
+                    ? [shipping['출고 부피']]
+                    : /actual|provided|captured/.test(weightType)
+                        ? [shipping['출고 중량']]
+                        : [shipping['출고 부피'], shipping['출고 중량']];
+                const weightMatch = Number.isFinite(fedexWeight) && candidateWeights.some(weight =>
+                    Number.isFinite(Number(weight)) && Math.abs(fedexWeight - Number(weight)) < 0.01
+                );
 
                 // 세 가지 조건이 모두 참인지 확인
-                if (dateMatch && sizeMatch && weightVolumeMatch) {
+                if (dateMatch && sizeMatch && weightMatch) {
                     bestMatchIndex = i;
                     break;
                 }
             }
             
             const matchedShippingInfo = bestMatchIndex !== -1 ? shippingDataCopy.splice(bestMatchIndex, 1)[0] : {};
-            comparisonResults.push({ ...fedex, ...matchedShippingInfo, '일치여부': bestMatchIndex !== -1 ? '✅ 일치' : '❌ 출고정보 없음' });
+            let status = '✅ 일치';
+            if (bestMatchIndex === -1) {
+                const sameDateRows = shippingDataCopy.filter(shipping => fedex.Fedex선적일 === shipping.OTOS출고일);
+                const sameDateAndSizeRows = sameDateRows.filter(shipping => fedexSizeNormalized === normalizeSize(shipping['출고 크기']));
+                status = sameDateRows.length === 0
+                    ? '❌ 출고일 불일치'
+                    : sameDateAndSizeRows.length === 0
+                        ? '❌ 크기 불일치'
+                        : '❌ 중량 불일치';
+            }
+            comparisonResults.push({ ...fedex, ...matchedShippingInfo, '일치여부': status });
         });
 
         shippingDataCopy.forEach(shipping => comparisonResults.push({ 'Fedex선적일': 'N/A', 'Tracking ID': 'N/A', '정격 중량': 'N/A', '중량 유형': 'N/A', '크기': 'N/A', ...shipping, '일치여부': '❌ FedEx정보 없음' }));
@@ -512,7 +646,7 @@
             table += '<tr>' + dataKeys.map(key => {
                 const value = row[key] ?? '';
                 if (key !== '일치여부') return `<td>${value}</td>`;
-                const className = value.includes('일치') ? 'status-match' : 'status-mismatch';
+                const className = value.startsWith('✅') ? 'status-match' : 'status-mismatch';
                 return `<td class="${className}">${value}</td>`;
             }).join('') + '</tr>';
         });
